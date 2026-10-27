@@ -82,7 +82,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* ---------- navigation: bottom bar on phones, left rail on wide screens */
 .nav {
   position: fixed; inset: auto 0 0 0; z-index: 10;
-  display: grid; grid-template-columns: repeat(5, 1fr);
+  display: grid; grid-template-columns: repeat(4, 1fr);
   height: calc(var(--nav-h) + env(safe-area-inset-bottom));
   padding-bottom: env(safe-area-inset-bottom);
   background: var(--surface); border-top: 1px solid var(--rule);
@@ -255,6 +255,17 @@ table { border-collapse: collapse; width: 100%; font-size: 15px; }
 th, td { text-align: right; padding: 8px 8px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
 th:first-child, td:first-child { text-align: left; white-space: normal; padding-left: 0; }
 th { font-weight: 600; color: var(--muted); }
+
+/* ---------- request form (home) */
+.ask { padding: 20px 18px 18px; }
+.ask .field:first-child { margin-top: 0; }
+.ask input[type="text"] { font-size: 20px; min-height: 52px; }
+.ask .btn { width: 100%; min-height: 52px; font-size: 18px; margin-top: 18px; }
+.ask .grid2 { gap: 0 18px; }
+@media (max-width: 420px) { .ask .grid2 { grid-template-columns: 1fr; } }
+.req-state { font-size: 14px; color: var(--muted); }
+.req-state.done { color: var(--ink); }
+.known { margin-top: 12px; padding: 10px 12px; border-radius: var(--radius-s); background: var(--board); }
 
 /* ---------- unlock */
 .unlock { max-width: 520px; margin: 8vh auto 0; }

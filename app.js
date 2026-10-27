@@ -87,6 +87,25 @@ async function fetchText(path) {
   return r.text();
 }
 
+async function ghApi(method, path, body) {
+  const r = await fetch(`https://api.github.com/repos/${SOURCE.repo}${path}`, {
+    method, cache: "no-store",
+    headers: { Authorization: `Bearer ${SOURCE.token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r;
+}
+
+async function loadRequests() {
+  if (SOURCE.kind !== "github") return { list: null, error: "local" };
+  try {
+    const r = await ghApi("GET", "/issues?labels=evaluate&state=all&per_page=15&sort=created&direction=desc");
+    if (r.status === 403 || r.status === 404) return { list: null, error: "permission" };
+    if (!r.ok) return { list: null, error: "network" };
+    return { list: await r.json(), error: null };
+  } catch { return { list: null, error: "network" }; }
+}
+
 async function detectLocal() {
   try {
     const r = await fetch("../board_game_model.md", { cache: "no-store" });
@@ -142,7 +161,7 @@ async function loadAll() {
   return {
     P, prof, release, games, snaps, userGames, preds, byGame, current, outcomes, audits,
     pending: csv("pending"), registry: parseCSV(raw.registry), cases: csv("cases"), metrics: JSON.parse(raw.metrics),
-    loadedAt: new Date(),
+    requests: await loadRequests(), loadedAt: new Date(),
   };
 }
 
@@ -240,31 +259,90 @@ function report(r) {
 }
 
 // ------------------------------------------------------------------ views
+let ask = { name: "", exposure: "No", owned: "No", note: "", status: "" };
+
+function requestState(issue) {
+  const body = issue.body || "";
+  const m = body.match(/Result:\s*(G\d{4})\s+(E[\w-]+)/);
+  if (issue.state === "closed" && m) {
+    const p = D.preds.find((x) => x.evaluation_id === m[2]);
+    return { done: true, gid: m[1], p, text: p ? "" : "Done. Reload to see the result." };
+  }
+  if (issue.state === "closed") return { done: true, text: issue.state_reason === "not_planned" ? "Cancelled" : "Closed without a result" };
+  if ((issue.labels || []).some((l) => l.name === "working")) return { text: "Claude is evaluating it now" };
+  if ((issue.labels || []).some((l) => l.name === "waiting")) return { text: "Waiting for your computer to read BGG" };
+  return { text: "Waiting for the next hourly run" };
+}
+
 function viewHome() {
   const waiting = [...D.current.entries()].filter(([gid, p]) => {
     const u = D.userGames.get(gid);
     return p.record_type === "preregistered" && u && truthy(u.owned) && !u.user_rating;
   }).map(([, p]) => p).sort((a, b) => num(b.predicted_rating) - num(a.predicted_rating));
   const open = D.pending.filter((p) => p.status === "open");
-  const latest = D.preds.filter((p) => p.record_type === "preregistered").sort((a, b) => String(b.prediction_date).localeCompare(String(a.prediction_date)) || b.evaluation_id.localeCompare(a.evaluation_id)).slice(0, 5);
-  const ownedCount = [...D.userGames.values()].filter((u) => truthy(u.owned)).length;
+  const R = D.requests || { list: null, error: "local" };
+  const known = [...D.games.values()].find((g) => ask.name.trim() && g.name.toLowerCase() === ask.name.trim().toLowerCase());
+  const knownPred = known && D.current.get(known.game_id);
+  const disabled = R.error === "local" || R.error === "permission";
 
   return `
-  <div class="pagehead"><div><h1>Critiq</h1><p class="lede">Model ${esc(D.release)}, ${ownedCount} games on the shelf, ${D.current.size} with a prediction.</p></div></div>
-  <h2>Waiting for first play</h2>
+  <h1>Evaluate a game</h1>
+  <p class="lede">Type a game. Claude looks it up on BGG, checks your eight reviewers, compares it with your shelf, and locks a verdict here.</p>
+  <form id="ask" class="panel ask" autocomplete="off">
+    <div class="field"><label for="a-name">Game</label>
+      <input id="a-name" type="text" list="ask-games" data-ask="name" value="${esc(ask.name)}" placeholder="e.g. Brass: Birmingham" required>
+      <datalist id="ask-games">${[...D.games.values()].map((g) => `<option value="${esc(g.name)}"></option>`).join("")}</datalist>
+      ${knownPred ? `<div class="known small">Already evaluated: ${verdictTag(knownPred.verdict)} at ${r2(num(knownPred.predicted_rating))}, ${fmtDate(knownPred.prediction_date)}. <a href="#/game/${esc(known.game_id)}">Open it</a> or request a fresh evaluation.</div>` : ""}
+    </div>
+    <div class="grid2">
+      <div class="field"><span class="label">Have you played it?</span>${seg("exposure", ["No", "Demoed", "Played"], ask.exposure, {}, "ask")}</div>
+      <div class="field"><span class="label">Do you own it?</span>${seg("owned", ["No", "Yes"], ask.owned, {}, "ask")}</div>
+    </div>
+    <div class="field"><label for="a-note">Anything Claude should know <span class="muted">(optional)</span></label>
+      <input id="a-note" type="text" data-ask="note" value="${esc(ask.note)}" placeholder="Edition, where you could try it, who you'd play with"></div>
+    <button class="btn" type="submit" ${disabled ? "disabled" : ""}>Evaluate</button>
+    ${ask.status ? `<p class="small" role="status" style="margin-top:12px">${ask.status}</p>` : ""}
+    ${R.error === "local" ? `<p class="muted small" style="margin-top:12px">Requests work on the hosted site. This preview reads local files only.</p>` : ""}
+    ${R.error === "permission" ? `<p class="error small" style="margin-top:12px">Your key can read the model but can't file requests. On GitHub, edit the key, set Issues to Read and write, save, then reload this page.</p>` : ""}
+    <p class="muted small" style="margin-top:12px">Claude checks for requests every hour from 7:00 to 23:00 and sends a notification to your phone when the verdict is ready.</p>
+  </form>
+
+  ${R.list && R.list.length ? `<h2>Your requests</h2><ul class="list">${R.list.map((i) => {
+    const st = requestState(i);
+    const name = i.title.replace(/^Evaluate:\s*/i, "");
+    if (st.p) return gameRow(st.p);
+    return `<li><div class="row"><span class="row-title">${esc(name)}</span><span class="req-state">${fmtDate(i.created_at)}</span><span class="row-sub">${esc(st.text)}</span></div></li>`;
+  }).join("")}</ul><div class="btnrow"><button class="btn secondary" type="button" data-action="reload">Check for updates</button></div>` : ""}
+
+  ${waiting.length ? `<h2>Waiting for first play</h2>
   <p class="muted">Locked before you played. Your first game settles the trial question.</p>
-  ${waiting.length ? waiting.map((p) => `
+  ${waiting.map((p) => `
     <div class="panel">
       <div class="row" style="padding:0"><a class="row-title" href="#/game/${esc(p.game_id)}"><h3>${esc(p.game)}</h3></a><span>${verdictTag(p.verdict)}</span></div>
       ${track(num(p.predicted_rating), null)}
       ${p.buy_only_if ? `<p><b>Keep only if:</b> ${esc(stripLead(p.buy_only_if))}</p>` : ""}
       ${p.trial_route ? `<p class="muted small">${esc(p.trial_route)}</p>` : ""}
-    </div>`).join("") : `<p class="empty">Nothing waiting. Lock a prediction before you play the next new game.</p>`}
-  <h2>Open decisions</h2>
-  ${open.length ? `<ul class="list">${open.map((p) => `<li><a class="row" href="#/model"><span class="row-title">${esc(p.topic)}</span><span class="muted">${esc(p.decision_id)}</span><span class="row-sub">Decide ${esc(p.decide_at)}</span></a></li>`).join("")}</ul>` : `<p class="empty">No open decisions.</p>`}
-  <h2>Latest clean evaluations</h2>
-  <ul class="list">${latest.map(gameRow).join("")}</ul>
-  <div class="btnrow"><a class="btn" href="#/evaluate">Evaluate a game</a><a class="btn secondary" href="#/games">All games</a></div>`;
+    </div>`).join("")}` : ""}
+  ${open.length ? `<h2>Open decisions</h2><ul class="list">${open.map((p) => `<li><a class="row" href="#/model"><span class="row-title">${esc(p.topic)}</span><span class="muted">${esc(p.decision_id)}</span><span class="row-sub">Decide ${esc(p.decide_at)}</span></a></li>`).join("")}</ul>` : ""}`;
+}
+
+async function submitAsk() {
+  const name = ask.name.trim();
+  if (!name) { ask.status = "Type the name of a game first."; route(); return; }
+  const body = [`Game: ${name}`, `Played or demoed: ${ask.exposure}`, `Owned: ${ask.owned}`, `Note: ${ask.note.trim() || "none"}`, "", "Filed from the Critiq site. Claude: evaluate per board_game_model.md section 11, then add a line `Result: <game_id> <evaluation_id>` to this body and close the issue.", "<!-- critiq-request v1 -->"].join("\n");
+  const btn = document.querySelector('#ask button[type="submit"]');
+  if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
+  try {
+    const r = await ghApi("POST", "/issues", { title: `Evaluate: ${name}`, body, labels: ["evaluate"] });
+    if (r.status === 403 || r.status === 404) { ask.status = `<span class="error">Your key can't file requests. On GitHub, edit the key and set Issues to Read and write.</span>`; D.requests = { list: null, error: "permission" }; }
+    else if (!r.ok) ask.status = `<span class="error">GitHub returned an error (${r.status}). Try again in a moment.</span>`;
+    else {
+      const issue = await r.json();
+      D.requests = { list: [issue, ...((D.requests && D.requests.list) || [])], error: null };
+      ask = { name: "", exposure: "No", owned: "No", note: "", status: `Requested ${esc(name)}. You'll get a notification when the verdict is ready.` };
+    }
+  } catch { ask.status = `<span class="error">Couldn't reach GitHub. Check your connection and try again.</span>`; }
+  route();
 }
 
 function gameRow(p) {
@@ -357,7 +435,7 @@ function viewGame(gid) {
   if (outs.length) html += `<h2>Outcomes</h2><ul class="list">${outs.map((o) => `<li><div class="row"><span class="row-title">${esc(o.event_type.replace(/_/g, " "))}</span><span class="muted">${fmtDate(o.outcome_date)}</span><span class="row-sub">${esc([o.decision, o.actual_rating ? `rated ${o.actual_rating}` : "", o.notes].filter(Boolean).join(". "))}</span></div></li>`).join("")}</ul>`;
   if (snap) html += `<p class="muted small" style="margin-top:20px">Latest BGG snapshot: ${esc(snap.bgg_average)}${snap.bgg_ratings_count ? ` from ${esc(Number(snap.bgg_ratings_count).toLocaleString("en-GB"))} ratings` : ""}, weight ${esc(snap.bgg_weight)}, ${snap.snapshot_date ? fmtDate(snap.snapshot_date) : "date not recorded"}.</p>`;
   if (list.length > 1) html += `<h2>Earlier predictions</h2><ul class="list">${list.filter((x) => x !== p).map((x) => `<li><div class="row"><span class="row-title">${esc(x.evaluation_id)}</span><span class="row-right">${verdictTag(x.verdict)}<span class="num">${r2(num(x.predicted_rating))}</span></span><span class="row-sub">${esc(COHORT[x.record_type] || x.record_type)}, ${fmtDate(x.prediction_date)}</span></div></li>`).join("")}</ul>`;
-  html += `<div class="btnrow"><a class="btn secondary" href="#/evaluate?game=${encodeURIComponent(gid)}">Try a what-if for this game</a></div>`;
+  html += `<div class="btnrow"><a class="btn secondary" href="#/evaluate?game=${encodeURIComponent(gid)}">What-if: change the inputs</a></div>`;
   return html;
 }
 
@@ -468,8 +546,23 @@ let draft = null;
 function prefillFromGame(gid) {
   const g = D.games.get(gid); if (!g) return false;
   const s = D.snaps.get(gid);
-  draft = { ...defaultDraft(), name: g.name, bgg: s?.bgg_average || "", count: s?.bgg_ratings_count || "", weight: s?.bgg_weight || "",
+  const p = D.current.get(gid);
+  draft = { ...defaultDraft(), name: g.name, bgg: s?.bgg_average || p?.bgg_average_at_prediction || "", count: s?.bgg_ratings_count || "", weight: s?.bgg_weight || "",
     minutes: g.playing_time_min || "", players: String(g.bgg_rec_players || "").split(",").map((x) => x.trim()).filter(Boolean).map((x) => Number(x) >= 9 ? "9+" : x) };
+  if (p) {
+    const b = (v) => truthy(v);
+    Object.assign(draft, {
+      signature: p.signature || "NONE", certainty: p.signature_certainty || "clear", iae: num(p.IAE) ?? 7,
+      maturity: ["established", "thin", "sparse"].includes(p.evidence_maturity) ? p.evidence_maturity : "established",
+      substitute: p.closest_substitute || "", differentiator: p.key_differentiator || "",
+      role: ["empty role", "incremental enhancer", "meaningful alternative", "redundant", "inferior substitute"].includes(p.collection_role) ? p.collection_role : "",
+      frictionException: FRICTION_EXC.includes(p.friction_exception_category) ? p.friction_exception_category : "",
+      materialRisk: b(p.material_unresolved_risk), riskText: p.material_risk_description || "",
+      longevity: [b(p.longevity_mastery), b(p.longevity_variability), b(p.longevity_adaptation)],
+      trialRoute: Boolean(p.trial_route), route: /FULL GAME/.test(p.trial_route) ? "FULL GAME" : /DEMO|demo/.test(p.trial_route) ? "DEMO" : "UNCERTAIN",
+      alphaPlayer: /alpha-player/.test(p.decision_path),
+    });
+  }
   return true;
 }
 
@@ -482,7 +575,7 @@ function evalInputs() {
     roleRescue: draft.roleRescue, longevityChecks: draft.longevity, materialRisk: draft.materialRisk, trialRoute: draft.trialRoute, calibrationCap: draft.calibrationCap, namedGroup: draft.namedGroup } };
 }
 
-const seg = (name, options, value, labels = {}) => `<div class="seg" role="radiogroup">${options.map((o) => `<label><input type="radio" name="${name}" value="${esc(o)}" ${o === value ? "checked" : ""} data-bind="${name}"><span>${esc(labels[o] || o)}</span></label>`).join("")}</div>`;
+const seg = (name, options, value, labels = {}, kind = "bind") => `<div class="seg" role="radiogroup">${options.map((o) => `<label><input type="radio" name="${name}" value="${esc(o)}" ${o === value ? "checked" : ""} data-${kind}="${name}"><span>${esc(labels[o] || o)}</span></label>`).join("")}</div>`;
 const toggle = (name, label, hint, checked) => `<label class="toggle"><input type="checkbox" data-bind="${name}" ${checked ? "checked" : ""}><span>${esc(label)}${hint ? `<small>${esc(hint)}</small>` : ""}</span></label>`;
 
 function viewEvaluate(params) {
@@ -491,13 +584,13 @@ function viewEvaluate(params) {
   const owned = [...D.userGames.values()].filter((u) => truthy(u.owned)).map((u) => u.game_name).sort();
   const capNames = Object.values(D.prof.caps).flatMap((c) => c.games);
   return `
-  <h1>Evaluate a game</h1>
-  <p class="lede">Runs the frozen v1.4 rules on your inputs. It's a what-if: nothing is saved to the model, and a locked evaluation still needs stamped BGG data and the reviewer audit.</p>
+  <h1>What-if</h1>
+  <p class="lede">Starts from the model's own inputs for a game. Change one and see how the verdict moves under the frozen v1.4 rules. Nothing is saved.</p>
   <form id="evalform" autocomplete="off" novalidate>
     <fieldset><legend>The game</legend>
       <div class="field"><label for="f-name">Name</label><input id="f-name" type="text" list="known-games" data-bind="name" value="${esc(draft.name)}">
         <datalist id="known-games">${[...D.games.values()].map((g) => `<option value="${esc(g.name)}"></option>`).join("")}</datalist>
-        <p class="hint">Pick a known game to fill in its BGG facts. The judgments stay yours.</p></div>
+        <p class="hint">Pick a known game to load its BGG facts and the model's latest judgments.</p></div>
       <div class="grid2">
         <div class="field"><label for="f-bgg">BGG average</label><input id="f-bgg" type="number" inputmode="decimal" step="0.001" min="1" max="10" data-bind="bgg" value="${esc(draft.bgg)}"></div>
         <div class="field"><label for="f-count">Number of ratings</label><input id="f-count" type="number" inputmode="numeric" min="0" data-bind="count" value="${esc(draft.count)}"></div>
@@ -510,7 +603,7 @@ function viewEvaluate(params) {
         <p class="hint">Use BGG's recommended counts, not only the best ones.</p></div>
     </fieldset>
 
-    <fieldset><legend>Your judgments</legend>
+    <fieldset><legend>The model's judgments</legend>
       <div class="field"><span class="label">Signature</span>${seg("signature", ["ECON", "COOP", "PRED", "NONE"], draft.signature)}<p class="hint" id="sig-help">${esc(SIG_HELP[draft.signature])}</p></div>
       <div class="field"><span class="label">How sure are you of the signature?</span>${seg("certainty", ["clear", "debatable"], draft.certainty, { clear: "Clear", debatable: "Debatable" })}</div>
       <div class="field"><label for="f-iae">Interaction and engagement (IAE)</label>
@@ -617,7 +710,7 @@ function viewUnlock(error) {
   main.innerHTML = `
   <div class="unlock">
     <h1>Critiq</h1>
-    <p class="lede">Your board game model lives in a private GitHub repository. Unlock this device with a read-only key and the site reads the repository directly from GitHub. The key stays in this browser only.</p>
+    <p class="lede">Your board game model lives in a private GitHub repository. Unlock this device with a GitHub key and the site reads the repository directly from GitHub. The key stays in this browser only.</p>
     ${error ? `<p class="error" role="alert">${esc(error)}</p>` : ""}
     <form id="unlock" class="panel">
       <div class="field" style="margin-top:0"><label for="u-key">GitHub key</label><input id="u-key" type="password" autocomplete="off" spellcheck="false" required></div>
@@ -628,10 +721,10 @@ function viewUnlock(error) {
     <ol>
       <li>On GitHub, open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">Settings, Developer settings, Fine-grained tokens</a>.</li>
       <li>Under Repository access, choose Only select repositories and pick BoardGameCritiq.</li>
-      <li>Under Permissions, set Contents to Read-only. Leave everything else as No access.</li>
+      <li>Under Repository permissions, set Contents to Read-only and Issues to Read and write. Leave everything else as No access.</li>
       <li>Pick an expiry, generate the key, and paste it above.</li>
     </ol>
-    <p class="muted small">A read-only key can't change your repository. To revoke it, delete it on the same GitHub page.</p>
+    <p class="muted small">This key can read your model and file evaluation requests, but it can't change your data. To revoke it, delete it on the same GitHub page.</p>
   </div>`;
   document.getElementById("unlock").addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -656,14 +749,14 @@ function route() {
   const [path, query = ""] = (location.hash.slice(1) || "/").split("?");
   const params = new URLSearchParams(query);
   const parts = path.split("/").filter(Boolean);
-  const tab = parts[0] === "game" ? "games" : parts[0] || "home";
+  const tab = parts[0] === "game" || parts[0] === "evaluate" ? "games" : parts[0] || "home";
   document.querySelectorAll(".nav a[data-tab]").forEach((a) => { if (a.dataset.tab === tab) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
   let html;
   switch (parts[0]) {
-    case undefined: html = viewHome(); document.title = "Critiq"; break;
+    case undefined: html = viewHome(); document.title = "Evaluate – Critiq"; break;
     case "games": html = viewGames(); document.title = "Games – Critiq"; break;
     case "game": html = viewGame(decodeURIComponent(parts[1] || "")); document.title = `${D.games.get(decodeURIComponent(parts[1] || ""))?.name || "Game"} – Critiq`; break;
-    case "evaluate": html = viewEvaluate(params); document.title = "Evaluate – Critiq"; break;
+    case "evaluate": html = viewEvaluate(params); document.title = "What-if – Critiq"; break;
     case "collection": html = viewShelf(); document.title = "Shelf – Critiq"; break;
     case "model": html = viewModel(); document.title = "Model – Critiq"; break;
     default: html = `<h1>Page not found</h1><p><a class="btn secondary" href="#/">Go home</a></p>`;
@@ -683,9 +776,7 @@ function bindDraft(t) {
   if (k === "name") {
     const g = [...D.games.values()].find((x) => x.name.toLowerCase() === t.value.trim().toLowerCase());
     if (g) {
-      const keep = { ...draft };
       prefillFromGame(g.game_id);
-      draft = { ...keep, ...Object.fromEntries(["name", "bgg", "count", "weight", "minutes", "players"].map((x) => [x, draft[x]])) };
       store.set(KEY_DRAFT, draft);
       route();
       return true;
@@ -700,8 +791,20 @@ function bindDraft(t) {
   return true;
 }
 
+main.addEventListener("submit", (ev) => {
+  if (ev.target.id === "ask") { ev.preventDefault(); submitAsk(); }
+});
 main.addEventListener("input", (ev) => {
   const t = ev.target;
+  if (t.dataset.ask) {
+    ask[t.dataset.ask] = t.value;
+    if (t.dataset.ask === "name") {
+      const hit = [...D.games.values()].some((g) => g.name.toLowerCase() === t.value.trim().toLowerCase());
+      const shown = !!document.querySelector(".known");
+      if (hit !== shown) { const pos = t.selectionStart; route(); const n = document.getElementById("a-name"); n.focus(); n.setSelectionRange(pos, pos); }
+    }
+    return;
+  }
   if (t.dataset.action === "game-search") {
     gameQuery = t.value;
     const pos = t.selectionStart;
@@ -713,6 +816,7 @@ main.addEventListener("input", (ev) => {
 });
 main.addEventListener("change", (ev) => {
   const t = ev.target;
+  if (t.dataset.ask && t.type === "radio") { ask[t.dataset.ask] = t.value; return; }
   if (t.dataset.bind && (t.type === "checkbox" || t.type === "radio" || t.tagName === "SELECT")) bindDraft(t);
 });
 main.addEventListener("click", async (ev) => {
